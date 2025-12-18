@@ -1,0 +1,44 @@
+# Configuration for Classifier Training
+
+# Model configuration
+model:
+  backbone: "hfl/chinese-roberta-wwm-ext"
+  hidden_dim: 512
+  dropout: 0.1
+
+# Training parameters
+training:
+  max_length: 512
+  batch_size: 32
+  epochs: 5
+  learning_rate: 2e-5
+  warmup_ratio: 0.1
+  seed: 42
+
+# Baseline models to train
+baselines:
+  - "majority"
+  - "stratified_random"
+  - "ngram_logistic"
+  - "ngram_svm"
+  - "fasttext"
+  - "frozen_backbone"
+
+# N-gram settings for baselines
+ngram:
+  range: [3, 6]
+  max_features: 10000
+
+# Paths
+paths:
+  train_file: "data/pools/pool_a.jsonl"
+  valid_file: "data/pools/pool_a_valid.jsonl"
+  test_file: "data/pools/pool_a_test.jsonl"
+  output_dir: "models/classifier"
+  baselines_output_dir: "models/baselines"
+
+# Metrics to track
+metrics:
+  - accuracy
+  - macro_f1
+  - auc

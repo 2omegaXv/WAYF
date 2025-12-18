@@ -1,0 +1,46 @@
+# Configuration for Data Preparation
+
+# Languages to sample from XL-Sum
+languages:
+  - english
+  - spanish
+  - french
+  - german
+  - arabic
+  - russian
+  - japanese
+  - korean
+
+# Sampling parameters
+sampling:
+  samples_per_language: 1000
+  field: "summary"  # or "text"
+  length_bin_size: 50
+  seed: 42
+
+# Pool splits (must sum to 1.0)
+pool_splits:
+  pool_a_ratio: 0.4  # Classifier training
+  pool_b_ratio: 0.3  # RL prompts
+  pool_c_ratio: 0.3  # Validation/evaluation
+
+# Deduplication settings
+deduplication:
+  exact_match: true
+  min_hash: false  # Set to true for near-duplicate detection
+
+# LLM translation settings
+llm_translation:
+  model_name: "gpt-4"
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 2048
+  prompt_version: "v1.0"
+  min_cjk_ratio: 0.7
+
+# Output paths
+output:
+  pools_dir: "data/pools"
+  translations_dir: "data/translations"
+  sft_dir: "data/sft"
+  rl_dir: "data/rl"
