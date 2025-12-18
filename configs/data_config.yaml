@@ -1,21 +1,23 @@
 # Configuration for Data Preparation
 
-# Languages to sample from XL-Sum
+# Languages to sample from XL-Sum (csebuetnlp/xlsum)
+# Available: english, french, japanese, korean, russian, spanish
 languages:
   - english
-  - spanish
   - french
-  - german
-  - arabic
-  - russian
   - japanese
   - korean
+  - russian
+  - spanish
 
 # Sampling parameters
 sampling:
-  samples_per_language: 1000
-  field: "summary"  # or "text"
-  length_bin_size: 50
+  paragraphs_per_language: 5000  # Total paragraphs per language (will be equal)
+  field: "text"  # Use full article text from XL-Sum
+  min_sentences_per_paragraph: 5  # Minimum sentences in each paragraph
+  max_sentences_per_paragraph: 7  # Maximum sentences in each paragraph
+  split: "train"  # Dataset split to use (train/validation/test)
+  length_bin_size: 100  # Bin size for length-based sampling
   seed: 42
 
 # Pool splits (must sum to 1.0)

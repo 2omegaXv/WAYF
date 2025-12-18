@@ -4,7 +4,7 @@
 
 ### 1.1 Choose languages + sampling
 - Select K source languages from XL-Sum.
-- Choose source field: start with `summary`.
+- Choose source field: start with `text`.
 - Balance per language: equal N samples/language.
 - Length matching: bin by length and sample evenly.
 - Deduplicate:

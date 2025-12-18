@@ -90,7 +90,7 @@ def translate_dataset(input_file: Path,
                       output_file: Path,
                       llm_client: LLMClient,
                       prompt_version: str,
-                      field: str = "summary",
+                      field: str = "text",
                       min_cjk_ratio: float = 0.7):
     """Translate a dataset from source languages to Chinese."""
     system_prompt = get_system_prompt()
@@ -170,7 +170,7 @@ def main():
     parser.add_argument("--top_p", type=float, default=1.0, help="Nucleus sampling parameter")
     parser.add_argument("--max_tokens", type=int, default=2048, help="Max tokens in response")
     parser.add_argument("--prompt_version", type=str, default="v1.0", help="Prompt version identifier")
-    parser.add_argument("--field", type=str, default="summary", help="Source text field")
+    parser.add_argument("--field", type=str, default="text", help="Source text field")
     parser.add_argument("--min_cjk_ratio", type=float, default=0.7, help="Minimum CJK character ratio")
     
     args = parser.parse_args()

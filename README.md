@@ -76,14 +76,17 @@ pip install -r requirements.txt
 ### 1. Data Preparation
 
 ```bash
-# Sample XL-Sum data
+# Sample XL-Sum data and split articles into 5-7 sentence paragraphs
+# Dataset: csebuetnlp/xlsum (uses 'text' field)
+# Creates equal number of paragraphs per language
 python scripts/01_sample_xlsum.py \
-    --data_path /path/to/xlsum \
-    --languages english spanish french german \
-    --samples_per_lang 1000 \
+    --languages english french japanese korean russian spanish \
+    --paragraphs_per_lang 1000 \
+    --min_sentences 5 \
+    --max_sentences 7 \
     --output_dir data/pools
 
-# Translate with LLM
+# Translate paragraphs with LLM
 python scripts/02_translate_with_llm.py \
     --input_file data/pools/pool_a.jsonl \
     --output_file data/translations/pool_a_translated.jsonl \
