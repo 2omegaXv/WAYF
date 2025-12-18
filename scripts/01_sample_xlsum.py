@@ -25,20 +25,168 @@ def get_length_bin(text: str, bin_size: int = 50) -> int:
     return len(text) // bin_size
 
 
-def split_into_sentences(text: str) -> List[str]:
-    """Split text into sentences using regex patterns."""
-    # Handle common sentence ending patterns
-    # This pattern handles periods, question marks, exclamation marks followed by space or end
-    sentence_pattern = r'(?<=[.!?])\s+(?=[A-Z])|(?<=[.!?])$'
-    sentences = re.split(sentence_pattern, text)
+def split_into_sentences(text: str, language: str = "english") -> List[str]:
+    """
+    Split text into sentences using language-specific patterns.
+    
+    Args:
+        text: Text to split
+        language: Language name (english, french, japanese, korean, russian, spanish)
+    
+    Returns:
+        List of sentences
+    """
+    # Language-specific sentence ending patterns
+    if language in ["japanese"]:
+        # Japanese: 。！?
+        sentence_pattern = r'[。！？]+'
+        sentences = re.split(sentence_pattern, text)
+        
+    elif language in ["korean"]:
+        # Korean: . ! ? (with Korean characters before)
+        sentence_pattern = r'(?<=[가-힣])[.!?]+'
+        sentences = re.split(sentence_pattern, text)
+        
+    elif language in ["chinese"]:
+        # Chinese: 。！？；
+        sentence_pattern = r'[。！？；]+'
+        sentences = re.split(sentence_pattern, text)
+        
+    elif language in ["russian"]:
+        # Russian: similar to English but with Cyrillic
+        sentence_pattern = r'(?<=[.!?])\s+(?=[А-ЯЁ])|(?<=[.!?])$'
+        sentences = re.split(sentence_pattern, text)
+        
+    else:
+        # English, French, Spanish, etc: . ! ?
+        sentence_pattern = r'(?<=[.!?])\s+(?=[A-ZÀ-Ü])|(?<=[.!?])$'
+        sentences = re.split(sentence_pattern, text)
     
     # Clean up and filter empty sentences
-    sentences = [s.strip() for s in sentences if s.strip()]
+    sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 10]
     
     return sentences
 
 
-def deduplicate_data(data: List[Dict], field: str = "text") -> List[Dict]:
+def create_paragraphs(text: str, language: str = "english", 
+                     min_sentences: int = 5, max_sentences: int = 7) -> List[str]:
+    """
+    Split text into paragraphs of 5-7 sentences.
+    
+    Args:
+        text: Full article text
+        language: Language name for proper sentence splitting
+        min_sentences: Minimum sentences per paragraph
+        max_sentences: Maximum sentences per paragraph
+    
+    Returns:
+        List of paragraph strings
+    """
+    sentences = split_into_sentences(text, language)
+    
+    if len(sentences) < min_sentences:
+        return []
+    
+    paragraphs = []
+    i = 0
+    
+    while i < len(sentences):
+        # Determine paragraph size (random between min and max)
+        remaining = len(sentences) - i
+        
+        if remaining < min_sentences:
+            # If remaining sentences less than minimum, add to last paragraph or skip
+            if paragraphs and remaining > 0:
+                # Add remaining sentences to last paragraph
+                paragraphs[-1] = paragraphs[-1] + ' ' + ' '.join(sentences[i:])
+            break
+        
+        para_size = min(max_sentences, max(min_sentences, remaining))
+        if remaining < max_sentences and remaining >= min_sentences:
+            para_size = remaining
+        
+        # Take sentences for this paragraph
+        paragraph_sentences = sentences[i:i + para_size]
+        
+        # Rejoin sentences (preserve original punctuation)
+        if language in ["japanese"]:
+            paragraph = ''.join(paragraph_sentences)  # No spaces in Japanese
+        elif language in ["chinese"]:
+            paragraph = ''.join(paragraph_sentences)  # No spaces in Chinese
+        else:
+            paragraph = ' '.join(paragraph_sentences)
+        
+        paragraphs.append(paragraph)
+        i += para_size
+    
+    return paragraphs
+
+
+def load_xlsum_data(languages: List[str],
+                    field: str = "text",
+                    min_sentences: int = 5,
+                    max_sentences: int = 7,
+                    split: str = "train") -> Dict[str, List[Dict]]:
+    """
+    Load XL-Sum dataset and split articles into paragraphs.
+    
+    Args:
+        languages: List of language names (e.g., ['english', 'french'])
+        field: Field to use ('text' for full article)
+        min_sentences: Minimum sentences per paragraph
+        max_sentences: Maximum sentences per paragraph
+        split: Dataset split to use ('train', 'validation', 'test')
+    
+    Returns:
+        Dictionary mapping language to list of paragraph items
+    """
+    data_by_lang = defaultdict(list)
+    
+    for lang in languages:
+        print(f"Loading {lang}...")
+        
+        try:
+            # Load dataset for this language
+            dataset = load_dataset("csebuetnlp/xlsum", lang, split=split, trust_remote_code=True)
+            
+            paragraph_count = 0
+            
+            for idx, example in enumerate(dataset):
+                article_text = example.get(field, "")
+                
+                if not article_text or len(article_text.strip()) < 50:
+                    continue
+                
+                # Split article into paragraphs (language-aware)
+                paragraphs = create_paragraphs(
+                    article_text, 
+                    language=lang,
+                    min_sentences=min_sentences,
+                    max_sentences=max_sentences
+                )
+                
+                # Create separate items for each paragraph
+                for para_idx, paragraph in enumerate(paragraphs):
+                    item = {
+                        'id': f"{lang}_{idx}_{para_idx}",
+                        'src_lang': lang,
+                        'src_text': paragraph,
+                        'original_id': example.get('id', f'{lang}_{idx}'),
+                        'article_idx': idx,
+                        'paragraph_idx': para_idx
+                    }
+                    data_by_lang[lang].append(item)
+                    paragraph_count += 1
+            
+            print(f"  Loaded {len(dataset)} articles → {paragraph_count} paragraphs")
+        
+        except Exception as e:
+            print(f"  Error loading {lang}: {e}")
+    
+    return data_by_lang
+
+
+def deduplicate_data(data: List[Dict], field: str = "src_text") -> List[Dict]:
     """Remove exact duplicates based on text hash."""
     seen_hashes: Set[str] = set()
     deduplicated = []
@@ -56,7 +204,7 @@ def deduplicate_data(data: List[Dict], field: str = "text") -> List[Dict]:
 
 def sample_balanced_paragraphs(data_by_lang: Dict[str, List[Dict]], 
                                paragraphs_per_lang: int,
-                               field: str = "text") -> Dict[str, List[Dict]]:
+                               field: str = "src_text") -> Dict[str, List[Dict]]:
     """
     Sample equal number of paragraphs per language with length matching.
     
@@ -88,7 +236,7 @@ def sample_balanced_paragraphs(data_by_lang: Dict[str, List[Dict]],
         length_bins = defaultdict(list)
         for item in items:
             text = item.get(field, "")
-            bin_idx = get_length_bin(text, bin_size=100)  # Use larger bins for paragraphs
+            bin_idx = get_length_bin(text, bin_size=100)
             length_bins[bin_idx].append(item)
         
         # Sample evenly across bins
@@ -114,109 +262,6 @@ def sample_balanced_paragraphs(data_by_lang: Dict[str, List[Dict]],
         print(f"  Sampled: {len(sampled_data[lang])} paragraphs")
     
     return sampled_data
-    """
-        languages: List of language names (e.g., ['english', 'french'])
-        field: Field to use ('text' for full article)
-        min_sentences: Minimum sentences per paragraph
-        max_sentences: Maximum sentences per paragraph
-        split: Dataset split to use ('train', 'validation', 'test')
-    
-    Returns:
-        Dictionary mapping language to list of paragraph items
-    """
-    data_by_lang = defaultdict(list)
-    
-    for lang in languages:
-        print(f"Loading {lang}...")
-        
-        try:
-            # Load dataset for this language
-            dataset = load_dataset("csebuetnlp/xlsum", lang, split=split, trust_remote_code=True)
-            
-            paragraph_count = 0
-            
-            for idx, example in enumerate(dataset):
-                article_text = example.get(field, "")
-                
-                if not article_text or len(article_text.strip()) < 50:
-                    continue
-                
-                # Split article into paragraphs
-                paragraphs = create_paragraphs(article_text, min_sentences, max_sentences)
-                
-                # Create separate items for each paragraph
-                for para_idx, paragraph in enumerate(paragraphs):
-                    item = {
-                        'id': f"{lang}_{idx}_{para_idx}",
-                        'src_lang': lang,
-                        'src_text': paragraph,
-                        'original_id': example.get('id', f'{lang}_{idx}'),
-                        'article_idx': idx,
-                        'paragraph_idx': para_idx
-                    }
-                    data_by_lang[lang].append(item)
-                    paragraph_count += 1
-            
-            print(f"  Loaded {len(dataset)} articles → {paragraph_count} paragraphs")
-        
-        except Exception as e:
-            print(f"  Error loading {lang}: {e}")
-    
-    return data_by_lang
-
-
-def deduplicate_data(data: List[Dict], field: str) -> List[Dict]:
-    """Remove exact duplicates based on text hash."""
-    seen_hashes: Set[str] = set()
-    deduplicated = []
-    
-    for item in data:
-        text = item.get(field, "")
-        text_hash = hash_text(text)
-        
-        if text_hash not in seen_hashes:
-            seen_hashes.add(text_hash)
-            deduplicated.append(item)
-    
-    return deduplicated
-
-
-def sample_balanced(data_by_lang: Dict[str, List[Dict]], 
-                   samples_per_lang: int,
-                   field: str = "text") -> Dict[str, List[Dict]]:
-    """Sample with length matching across languages."""
-    sampled_data = {}
-    
-    for lang, items in data_by_lang.items():
-        # Deduplicate first
-        items = deduplicate_data(items, field)
-        
-        # Group by length bins
-        length_bins = defaultdict(list)
-        for item in items:
-            text = item.get(field, "")
-            bin_idx = get_length_bin(text)
-            length_bins[bin_idx].append(item)
-        
-        # Sample evenly across bins
-        samples = []
-        bins = sorted(length_bins.keys())
-        samples_per_bin = max(1, samples_per_lang // len(bins))
-        
-        for bin_idx in bins:
-            bin_items = length_bins[bin_idx]
-            n_samples = min(len(bin_items), samples_per_bin)
-            samples.extend(random.sample(bin_items, n_samples))
-        
-        # If we need more samples, take randomly from remaining
-        if len(samples) < samples_per_lang:
-            remaining = [item for item in items if item not in samples]
-            additional = min(len(remaining), samples_per_lang - len(samples))
-            samples.extend(random.sample(remaining, additional))
-        
-        sampled_data[lang] = samples[:samples_per_lang]
-    
-    return sampled_data
 
 
 def split_into_pools(data_by_lang: Dict[str, List[Dict]], 
@@ -231,10 +276,33 @@ def split_into_pools(data_by_lang: Dict[str, List[Dict]],
         start_idx = 0
         for pool_name, ratio in pool_ratios.items():
             n_pool = int(n_total * ratio)
+            end_idx = start_idx + n_pool
+            
+            pools[pool_name][lang] = items[start_idx:end_idx]
+            start_idx = end_idx
+    
+    return pools
+
+
+def save_pools(pools: Dict[str, Dict[str, List[Dict]]], output_dir: Path):
+    """Save pools to JSONL files."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    for pool_name, pool_data in pools.items():
+        output_file = output_dir / f"pool_{pool_name.lower()}.jsonl"
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for lang, items in pool_data.items():
+                for item in items:
+                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
+        
+        print(f"Saved Pool {pool_name} to {output_file}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sample XL-Sum data with paragraph splitting")
     parser.add_argument("--languages", nargs="+", required=True, 
-                       help="List of source languages (e.g., english french japanese)")
+                       help="List of source languages (e.g., english french japanese korean)")
     parser.add_argument("--paragraphs_per_lang", type=int, default=1000, 
                        help="Number of paragraphs per language (final total will be equal)")
     parser.add_argument("--field", type=str, default="text", 
@@ -306,30 +374,6 @@ def main():
         print(f"\nPool {pool_name}: {total} paragraphs across {len(pool_data)} languages")
         for lang, items in pool_data.items():
             print(f"  {lang}: {len(items)} paragraphs")
-    # Sample balanced data
-    print("Sampling balanced data with length matching...")
-    sampled_data = sample_balanced(data_by_lang, args.samples_per_lang, args.field)
-    
-    # Split into pools
-    print("Splitting into disjoint pools...")
-    pool_ratios = {
-        'A': args.pool_a_ratio,
-        'B': args.pool_b_ratio,
-        'C': args.pool_c_ratio
-    }
-    pools = split_into_pools(sampled_data, pool_ratios)
-    
-    # Save pools
-    print("Saving pools...")
-    save_pools(pools, Path(args.output_dir))
-    
-    # Print statistics
-    print("\n=== Statistics ===")
-    for pool_name, pool_data in pools.items():
-        total = sum(len(items) for items in pool_data.values())
-        print(f"Pool {pool_name}: {total} samples across {len(pool_data)} languages")
-        for lang, items in pool_data.items():
-            print(f"  {lang}: {len(items)} samples")
 
 
 if __name__ == "__main__":

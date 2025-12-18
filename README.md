@@ -1,4 +1,4 @@
-# WAYF: Weakening the Artifact of Your Foreign-language translations
+# Where Are You From: Source Language Detection in Translation
 
 Research project for reducing translationese in multilingual-to-Chinese neural machine translation using reinforcement learning with source language classifiers as reward signals.
 
