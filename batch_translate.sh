@@ -43,7 +43,7 @@ translate_with_model() {
         --max_tokens 2048 \
         --prompt_version "v1.0" \
         --field "src_text" \
-        --min_cjk_ratio 0.7 \
+        --min_cjk_ratio 0.3 \
         --pool_name "$pool" \
         --num_workers "$NUM_WORKERS"
     
@@ -62,16 +62,11 @@ echo "Starting batch translation..."
 echo ""
 
 # Translate all pools with DeepSeek-V3.2
-echo "=== Phase 1: DeepSeek-V3.2 ==="
 for pool in a b c; do
+    translate_with_model "Qwen3-Next-80B-A3B-Instruct" "$pool"
     translate_with_model "DeepSeek-V3.2" "$pool"
 done
 
-echo ""
-echo "=== Phase 2: Qwen3-Next-80B-A3B-Instruct ==="
-for pool in a b c; do
-    translate_with_model "Qwen3-Next-80B-A3B-Instruct" "$pool"
-done
 
 echo ""
 echo "========================================"

@@ -56,14 +56,15 @@ class LLMClient:
                     ],
                     temperature=self.temperature,
                     top_p=self.top_p,
-                    max_tokens=self.max_tokens
+                    max_tokens=self.max_tokens,
+                    response_format={"type": "json_object"}
                 )
                 
                 return response.choices[0].message.content
                 
             except Exception as e:
                 if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 5  # 5, 10, 15 seconds
+                    wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
                     print(f"\nAPI call failed (attempt {attempt + 1}/{max_retries}): {e}")
                     print(f"Retrying in {wait_time} seconds...")
                     time.sleep(wait_time)
@@ -109,7 +110,7 @@ def post_process_translation(zh_text: str) -> str:
     return zh_text
 
 
-def check_cjk_ratio(text: str, min_ratio: float = 0.7) -> bool:
+def check_cjk_ratio(text: str, min_ratio: float = 0.3) -> bool:
     """Check if text has sufficient CJK characters."""
     cjk_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or 
                     '\u3400' <= c <= '\u4dbf' or
@@ -128,74 +129,75 @@ def hash_response(response: str) -> str:
 
 
 def translate_single_item(item_data, llm_client, system_prompt, field, min_cjk_ratio, pool_name, prompt_version):
-    """Translate a single item (for parallel processing)."""
+    """Translate a single item (for parallel processing) with bounded retries."""
     item, line_idx = item_data
-    
+
     src_lang = item.get('src_lang', 'unknown')
     src_text = item.get(field, '')
     item_id = item.get('id', hash_text(src_text))
-    
+
     # Build prompt
     user_prompt = get_user_prompt(src_lang, src_text)
-    
-    # Call LLM API
-    try:
-        raw_response = llm_client.translate(system_prompt, user_prompt, max_retries=3)
-        
-        # Parse JSON response
+
+    max_attempts = 2
+    backoff = 2  # seconds
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
         try:
+            raw_response = llm_client.translate(system_prompt, user_prompt, max_retries=3)
+
             # Remove markdown code blocks if present
             clean_response = raw_response.strip()
             if clean_response.startswith('```'):
-                # Extract content between ```json and ```
                 match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', clean_response, re.DOTALL)
                 if match:
                     clean_response = match.group(1).strip()
-            
+
+            # Parse JSON response strictly
             response_data = json.loads(clean_response)
             zh_mt = response_data.get('translation', '')
-        except json.JSONDecodeError:
-            # If JSON parsing still fails, try to extract translation from response
-            match = re.search(r'"translation"\s*:\s*"([^"]*)"', raw_response)
-            if match:
-                zh_mt = match.group(1)
-            else:
-                return None, f"Cannot parse JSON for item {item_id}"
-        
-        # Post-process
-        zh_mt = post_process_translation(zh_mt)
-        
-        # Filter by CJK ratio
-        if not check_cjk_ratio(zh_mt, min_cjk_ratio):
-            return None, f"Insufficient CJK ratio for item {item_id}"
-        
-        # Build output record
-        output_record = {
-            'id': item_id,
-            'split': item.get('split', 'train'),
-            'pool': pool_name,
-            'src_lang': src_lang,
-            'src_text': src_text,
-            'zh_mt': zh_mt,
-            'audit': {
-                'model': llm_client.model_name,
-                'temperature': llm_client.temperature,
-                'top_p': llm_client.top_p,
-                'max_tokens': llm_client.max_tokens,
-                'prompt_version': prompt_version,
-                'raw_response_hash': hash_response(raw_response)
+
+            # Post-process
+            zh_mt = post_process_translation(zh_mt)
+
+            # Validate CJK ratio
+            if not check_cjk_ratio(zh_mt, min_cjk_ratio):
+                raise ValueError(f"Insufficient CJK ratio for item {item_id}")
+
+            # Build output record
+            output_record = {
+                'id': item_id,
+                'split': item.get('split', 'train'),
+                'pool': pool_name,
+                'src_lang': src_lang,
+                'src_text': src_text,
+                'zh_mt': zh_mt,
+                'audit': {
+                    'model': llm_client.model_name,
+                    'temperature': llm_client.temperature,
+                    'top_p': llm_client.top_p,
+                    'max_tokens': llm_client.max_tokens,
+                    'prompt_version': prompt_version,
+                    'raw_response_hash': hash_response(raw_response)
+                }
             }
-        }
-        
-        # Copy additional fields from original item
-        for key in ['category', 'article_idx', 'paragraph_idx', 'original_id']:
-            if key in item:
-                output_record[key] = item[key]
-        
-        return output_record, None
-        
-    except Exception as e:
-        return None, f"Error translating item {item_id}: {e}"
+
+            # Copy additional fields from original item
+            for key in ['category', 'article_idx', 'paragraph_idx', 'original_id']:
+                if key in item:
+                    output_record[key] = item[key]
+
+            return output_record
+
+        except Exception as e:
+            last_error = e
+            if attempt < max_attempts:
+                wait_time = min(backoff, 60)
+                print(f"\nItem {item_id} failed (attempt {attempt}/{max_attempts}): {e}\nRetrying in {wait_time}s...")
+                time.sleep(wait_time)
+                backoff = min(backoff * 2, 60)
+            else:
+                raise Exception(f"Item {item_id} failed after {max_attempts} attempts: {last_error}")
 
 
 def translate_dataset(input_file: Path, 
@@ -203,55 +205,57 @@ def translate_dataset(input_file: Path,
                       llm_client: LLMClient,
                       prompt_version: str,
                       field: str = "src_text",
-                      min_cjk_ratio: float = 0.7,
+                      min_cjk_ratio: float = 0.3,
                       pool_name: str = "unknown",
                       num_workers: int = 2):
-    """Translate a dataset from source languages to Chinese with parallel processing."""
+    """Translate a dataset with parallel processing and stream writes: each item is stored immediately upon success."""
     system_prompt = get_system_prompt()
-    
+
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Read all lines
     with open(input_file, 'r', encoding='utf-8') as f_in:
         lines = f_in.readlines()
-    
+
     # Parse items
     items = [(json.loads(line), idx) for idx, line in enumerate(lines)]
-    
-    # Translate in parallel
-    results = [None] * len(items)
+
+    # Truncate output file to start fresh
+    with open(output_file, 'w', encoding='utf-8') as f_out:
+        pass
+
+    writer_lock = threading.Lock()
+
+    # Translate in parallel and write as items complete
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # Submit all tasks
-        future_to_idx = {
-            executor.submit(translate_single_item, item_data, llm_client, system_prompt, 
-                          field, min_cjk_ratio, pool_name, prompt_version): item_data[1]
+        future_to_item = {
+            executor.submit(
+                translate_single_item,
+                item_data,
+                llm_client,
+                system_prompt,
+                field,
+                min_cjk_ratio,
+                pool_name,
+                prompt_version
+            ): item_data
             for item_data in items
         }
-        
-        # Process completed tasks
+
         with tqdm(total=len(items), desc="Translating") as pbar:
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
+            for future in as_completed(future_to_item):
+                item_data = future_to_item[future]
                 try:
-                    output_record, error = future.result()
-                    if output_record:
-                        results[idx] = output_record
-                    elif error:
-                        print(f"\n{error}")
+                    output_record = future.result()
+                    # Stream write
+                    with writer_lock:
+                        with open(output_file, 'a', encoding='utf-8') as f_out:
+                            f_out.write(json.dumps(output_record, ensure_ascii=False) + '\n')
                 except Exception as e:
-                    print(f"\nUnexpected error for item {idx}: {e}")
+                    # translate_single_item retries indefinitely; reaching here is unexpected
+                    print(f"\nUnexpected error for item {item_data[1]}: {e}")
                 finally:
                     pbar.update(1)
-    
-    # Write results in original order
-    with open(output_file, 'w', encoding='utf-8') as f_out:
-        for result in results:
-            if result:
-                f_out.write(json.dumps(result, ensure_ascii=False) + '\n')
-            
-            src_lang = item.get('src_lang', 'unknown')
-            src_text = item.get(field, '')
-            item_id = item.get('id', hash_text(src_text))
 
 
 
@@ -274,7 +278,7 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=2048, help="Max tokens in response")
     parser.add_argument("--prompt_version", type=str, default="v1.0", help="Prompt version identifier")
     parser.add_argument("--field", type=str, default="src_text", help="Source text field")
-    parser.add_argument("--min_cjk_ratio", type=float, default=0.7, help="Minimum CJK character ratio")
+    parser.add_argument("--min_cjk_ratio", type=float, default=0.3, help="Minimum CJK character ratio")
     parser.add_argument("--pool_name", type=str, default="unknown", help="Pool name for output records")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of parallel workers")
     

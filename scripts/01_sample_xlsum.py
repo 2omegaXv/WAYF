@@ -1,7 +1,7 @@
 """
 Script for sampling XL-Sum data with language selection, length matching, and deduplication.
 Implements step 1.1 and 1.2 from project procedure.
-Splits text articles into 5-7 sentence paragraphs.
+Splits text articles into 6-8 sentence paragraphs.
 """
 
 import argparse
@@ -53,13 +53,25 @@ def split_into_sentences(text: str, language: str = "english") -> List[str]:
         sentences = re.split(sentence_pattern, text)
         
     elif language in ["russian"]:
-        # Russian: similar to English but with Cyrillic
-        sentence_pattern = r'(?<=[.!?])\s+(?=[А-ЯЁ])|(?<=[.!?])$'
+        # Russian: similar to English but with Cyrillic; consider closing/opening quotes/parentheses around punctuation
+        sentence_pattern = (
+            r'(?<=[.!?]["\'”’\)])\s+(?=[А-ЯЁ])'   # punctuation + closing quote/bracket then space before capital
+            r'|(?<=[.!?])\s+(?=[А-ЯЁ])'              # punctuation then space before capital
+            r'|(?<=[.!?])\s+(?=["\'“‘][А-ЯЁ])'     # punctuation then space + opening quote before capital
+            r'|(?<=[.!?]["\'”’\)])$'               # punctuation + closing quote/bracket at end of string
+            r'|(?<=[.!?])$'                           # punctuation at end of string
+        )
         sentences = re.split(sentence_pattern, text)
         
     else:
-        # English, French, Spanish, etc: . ! ?
-        sentence_pattern = r'(?<=[.!?])\s+(?=[A-ZÀ-Ü])|(?<=[.!?])$'
+        # English, French, Spanish, etc: . ! ? and respect quotes/parentheses around sentence boundaries
+        sentence_pattern = (
+            r'(?<=[.!?]["\'”’\)])\s+(?=[A-ZÀ-Ü])'   # punctuation + closing quote/bracket then space before capital
+            r'|(?<=[.!?])\s+(?=[A-ZÀ-Ü])'              # punctuation then space before capital
+            r'|(?<=[.!?])\s+(?=["\'“‘][A-ZÀ-Ü])'     # punctuation then space + opening quote before capital
+            r'|(?<=[.!?]["\'”’\)])$'                 # punctuation + closing quote/bracket at end of string
+            r'|(?<=[.!?])$'                             # punctuation at end of string
+        )
         sentences = re.split(sentence_pattern, text)
     
     # Clean up and filter empty sentences
@@ -69,9 +81,9 @@ def split_into_sentences(text: str, language: str = "english") -> List[str]:
 
 
 def create_paragraphs(text: str, language: str = "english", 
-                     min_sentences: int = 5, max_sentences: int = 7) -> List[str]:
+                     min_sentences: int = 6, max_sentences: int = 8) -> List[str]:
     """
-    Split text into paragraphs of 5-7 sentences.
+    Split text into paragraphs of 6-8 sentences.
     
     Args:
         text: Full article text
@@ -124,8 +136,8 @@ def create_paragraphs(text: str, language: str = "english",
 
 def load_xlsum_data(languages: List[str],
                     field: str = "text",
-                    min_sentences: int = 5,
-                    max_sentences: int = 7,
+                    min_sentences: int = 6,
+                    max_sentences: int = 8,
                     split: str = "train") -> Dict[str, List[Dict]]:
     """
     Load XL-Sum dataset and split articles into paragraphs.
@@ -307,9 +319,9 @@ def main():
                        help="Number of paragraphs per language (final total will be equal)")
     parser.add_argument("--field", type=str, default="text", 
                        help="Field to use from XL-Sum (text for full article)")
-    parser.add_argument("--min_sentences", type=int, default=5, 
+    parser.add_argument("--min_sentences", type=int, default=6, 
                        help="Minimum sentences per paragraph")
-    parser.add_argument("--max_sentences", type=int, default=7, 
+    parser.add_argument("--max_sentences", type=int, default=8, 
                        help="Maximum sentences per paragraph")
     parser.add_argument("--output_dir", type=str, default="data/pools", 
                        help="Output directory")
