@@ -10,8 +10,8 @@ model:
 training:
   max_length: 512
   batch_size: 32
-  epochs: 5
-  learning_rate: 2e-5
+  epochs: 10
+  learning_rate: 1e-4
   warmup_ratio: 0.1
   seed: 42
 
@@ -31,9 +31,10 @@ ngram:
 
 # Paths
 paths:
-  train_file: "data/pools/pool_a.jsonl"
-  valid_file: "data/pools/pool_a_valid.jsonl"
-  test_file: "data/pools/pool_a_test.jsonl"
+  train_file: "data/translations/Qwen3-Next-80B-A3B-Instruct/pool_a_zh.jsonl"
+  train_file_supplement: "data/translations/Qwen3-Next-80B-A3B-Instruct/pool_a_augmented_zh.jsonl"
+  valid_file: "data/translations/Qwen3-Next-80B-A3B-Instruct/pool_c_zh.jsonl"
+  test_file: "data/translations/Qwen3-Next-80B-A3B-Instruct/pool_c_zh.jsonl"
   output_dir: "models/classifier"
   baselines_output_dir: "models/baselines"
 
@@ -42,3 +43,24 @@ metrics:
   - accuracy
   - macro_f1
   - auc
+
+# Hugging Face download/cache settings (optional)
+# - cache_dir: where HF stores its cache (defaults to ~/.cache/huggingface)
+# - local_dir: project-local snapshot directory for the backbone repo
+hf:
+  cache_dir: null
+  local_dir: models/hf_backbones/chinese-roberta-wwm-ext
+
+# Weights & Biases (optional)
+# Note: Storing API keys in a file is convenient but not ideal; prefer setting
+# WANDB_API_KEY in the environment. If you do set it here, the training script
+# will export it to the process env.
+wandb:
+  enabled: True
+  api_key: 263de5fa51af1052229a0f6dcbb9c7c02f68b417
+  entity: null
+  project: "WAYF"
+  name: trail_1
+  tags: []
+  notes: null
+  mode: "online"   # online | offline | disabled
