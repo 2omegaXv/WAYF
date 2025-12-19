@@ -8,26 +8,67 @@ import json
 import hashlib
 import re
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import time
 from tqdm import tqdm
+import openai
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 
-# TODO: Replace with actual API client (OpenAI, Anthropic, etc.)
 class LLMClient:
-    """Placeholder for LLM API client."""
+    """LLM API client using OpenAI SDK with support for multiple API keys."""
     
-    def __init__(self, model_name: str, temperature: float = 0.0, top_p: float = 1.0, max_tokens: int = 2048):
+    def __init__(self, model_name: str, api_keys: List[str], base_url: str, 
+                 temperature: float = 0.0, top_p: float = 1.0, max_tokens: int = 2048):
         self.model_name = model_name
         self.temperature = temperature
         self.top_p = top_p
         self.max_tokens = max_tokens
+        self.base_url = base_url
+        
+        # Initialize multiple OpenAI clients for different API keys
+        self.clients = [
+            openai.OpenAI(api_key=key, base_url=f"{base_url}/v1/")
+            for key in api_keys
+        ]
+        self.current_client_idx = 0
+        self.client_lock = threading.Lock()
     
-    def translate(self, system_prompt: str, user_prompt: str) -> str:
-        """Call LLM API for translation."""
-        # TODO: Implement actual API call
-        # This is a placeholder
-        raise NotImplementedError("Implement LLM API call")
+    def get_next_client(self):
+        """Get next client in round-robin fashion."""
+        with self.client_lock:
+            client = self.clients[self.current_client_idx]
+            self.current_client_idx = (self.current_client_idx + 1) % len(self.clients)
+            return client
+    
+    def translate(self, system_prompt: str, user_prompt: str, max_retries: int = 3) -> str:
+        """Call LLM API for translation with retry logic."""
+        for attempt in range(max_retries):
+            try:
+                # Get next client in round-robin
+                client = self.get_next_client()
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    max_tokens=self.max_tokens
+                )
+                
+                return response.choices[0].message.content
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5  # 5, 10, 15 seconds
+                    print(f"\nAPI call failed (attempt {attempt + 1}/{max_retries}): {e}")
+                    print(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    raise Exception(f"API call failed after {max_retries} attempts: {e}")
 
 
 def get_system_prompt() -> str:
@@ -86,74 +127,132 @@ def hash_response(response: str) -> str:
     return hashlib.sha256(response.encode('utf-8')).hexdigest()
 
 
+def translate_single_item(item_data, llm_client, system_prompt, field, min_cjk_ratio, pool_name, prompt_version):
+    """Translate a single item (for parallel processing)."""
+    item, line_idx = item_data
+    
+    src_lang = item.get('src_lang', 'unknown')
+    src_text = item.get(field, '')
+    item_id = item.get('id', hash_text(src_text))
+    
+    # Build prompt
+    user_prompt = get_user_prompt(src_lang, src_text)
+    
+    # Call LLM API
+    try:
+        raw_response = llm_client.translate(system_prompt, user_prompt, max_retries=3)
+        
+        # Parse JSON response
+        try:
+            # Remove markdown code blocks if present
+            clean_response = raw_response.strip()
+            if clean_response.startswith('```'):
+                # Extract content between ```json and ```
+                match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', clean_response, re.DOTALL)
+                if match:
+                    clean_response = match.group(1).strip()
+            
+            response_data = json.loads(clean_response)
+            zh_mt = response_data.get('translation', '')
+        except json.JSONDecodeError:
+            # If JSON parsing still fails, try to extract translation from response
+            match = re.search(r'"translation"\s*:\s*"([^"]*)"', raw_response)
+            if match:
+                zh_mt = match.group(1)
+            else:
+                return None, f"Cannot parse JSON for item {item_id}"
+        
+        # Post-process
+        zh_mt = post_process_translation(zh_mt)
+        
+        # Filter by CJK ratio
+        if not check_cjk_ratio(zh_mt, min_cjk_ratio):
+            return None, f"Insufficient CJK ratio for item {item_id}"
+        
+        # Build output record
+        output_record = {
+            'id': item_id,
+            'split': item.get('split', 'train'),
+            'pool': pool_name,
+            'src_lang': src_lang,
+            'src_text': src_text,
+            'zh_mt': zh_mt,
+            'audit': {
+                'model': llm_client.model_name,
+                'temperature': llm_client.temperature,
+                'top_p': llm_client.top_p,
+                'max_tokens': llm_client.max_tokens,
+                'prompt_version': prompt_version,
+                'raw_response_hash': hash_response(raw_response)
+            }
+        }
+        
+        # Copy additional fields from original item
+        for key in ['category', 'article_idx', 'paragraph_idx', 'original_id']:
+            if key in item:
+                output_record[key] = item[key]
+        
+        return output_record, None
+        
+    except Exception as e:
+        return None, f"Error translating item {item_id}: {e}"
+
+
 def translate_dataset(input_file: Path, 
                       output_file: Path,
                       llm_client: LLMClient,
                       prompt_version: str,
-                      field: str = "text",
-                      min_cjk_ratio: float = 0.7):
-    """Translate a dataset from source languages to Chinese."""
+                      field: str = "src_text",
+                      min_cjk_ratio: float = 0.7,
+                      pool_name: str = "unknown",
+                      num_workers: int = 2):
+    """Translate a dataset from source languages to Chinese with parallel processing."""
     system_prompt = get_system_prompt()
     
     output_file.parent.mkdir(parents=True, exist_ok=True)
     
-    with open(input_file, 'r', encoding='utf-8') as f_in, \
-         open(output_file, 'w', encoding='utf-8') as f_out:
-        
+    # Read all lines
+    with open(input_file, 'r', encoding='utf-8') as f_in:
         lines = f_in.readlines()
+    
+    # Parse items
+    items = [(json.loads(line), idx) for idx, line in enumerate(lines)]
+    
+    # Translate in parallel
+    results = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks
+        future_to_idx = {
+            executor.submit(translate_single_item, item_data, llm_client, system_prompt, 
+                          field, min_cjk_ratio, pool_name, prompt_version): item_data[1]
+            for item_data in items
+        }
         
-        for line in tqdm(lines, desc="Translating"):
-            item = json.loads(line)
+        # Process completed tasks
+        with tqdm(total=len(items), desc="Translating") as pbar:
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    output_record, error = future.result()
+                    if output_record:
+                        results[idx] = output_record
+                    elif error:
+                        print(f"\n{error}")
+                except Exception as e:
+                    print(f"\nUnexpected error for item {idx}: {e}")
+                finally:
+                    pbar.update(1)
+    
+    # Write results in original order
+    with open(output_file, 'w', encoding='utf-8') as f_out:
+        for result in results:
+            if result:
+                f_out.write(json.dumps(result, ensure_ascii=False) + '\n')
             
             src_lang = item.get('src_lang', 'unknown')
             src_text = item.get(field, '')
             item_id = item.get('id', hash_text(src_text))
-            
-            # Build prompt
-            user_prompt = get_user_prompt(src_lang, src_text)
-            
-            # Call LLM API
-            try:
-                raw_response = llm_client.translate(system_prompt, user_prompt)
-                
-                # Parse JSON response
-                response_data = json.loads(raw_response)
-                zh_mt = response_data.get('translation', '')
-                
-                # Post-process
-                zh_mt = post_process_translation(zh_mt)
-                
-                # Filter by CJK ratio
-                if not check_cjk_ratio(zh_mt, min_cjk_ratio):
-                    print(f"\nSkipping item {item_id}: insufficient CJK ratio")
-                    continue
-                
-                # Build output record
-                output_record = {
-                    'id': item_id,
-                    'split': item.get('split', 'train'),
-                    'pool': item.get('pool', 'unknown'),
-                    'src_lang': src_lang,
-                    'src_text': src_text,
-                    'zh_mt': zh_mt,
-                    'audit': {
-                        'model': llm_client.model_name,
-                        'temperature': llm_client.temperature,
-                        'top_p': llm_client.top_p,
-                        'max_tokens': llm_client.max_tokens,
-                        'prompt_version': prompt_version,
-                        'raw_response_hash': hash_response(raw_response)
-                    }
-                }
-                
-                f_out.write(json.dumps(output_record, ensure_ascii=False) + '\n')
-                
-            except Exception as e:
-                print(f"\nError translating item {item_id}: {e}")
-                continue
-            
-            # Rate limiting
-            time.sleep(0.1)
+
 
 
 def hash_text(text: str) -> str:
@@ -165,19 +264,30 @@ def main():
     parser = argparse.ArgumentParser(description="Translate dataset using LLM API")
     parser.add_argument("--input_file", type=str, required=True, help="Input JSONL file")
     parser.add_argument("--output_file", type=str, required=True, help="Output JSONL file")
-    parser.add_argument("--model_name", type=str, default="gpt-4", help="LLM model name")
+    parser.add_argument("--api_keys", type=str, 
+                       default="sk-urQ1kd8QaBdMIrnwW8_0Xw,sk-zGRy0CJMC1mpIooqyIstfQ", 
+                       help="API keys (comma-separated for parallel processing)")
+    parser.add_argument("--base_url", type=str, default="https://llmapi.paratera.com", help="API base URL")
+    parser.add_argument("--model_name", type=str, default="DeepSeek-V3.2", help="LLM model name")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=1.0, help="Nucleus sampling parameter")
     parser.add_argument("--max_tokens", type=int, default=2048, help="Max tokens in response")
     parser.add_argument("--prompt_version", type=str, default="v1.0", help="Prompt version identifier")
-    parser.add_argument("--field", type=str, default="text", help="Source text field")
+    parser.add_argument("--field", type=str, default="src_text", help="Source text field")
     parser.add_argument("--min_cjk_ratio", type=float, default=0.7, help="Minimum CJK character ratio")
+    parser.add_argument("--pool_name", type=str, default="unknown", help="Pool name for output records")
+    parser.add_argument("--num_workers", type=int, default=2, help="Number of parallel workers")
     
     args = parser.parse_args()
+    
+    # Parse API keys
+    api_keys = [key.strip() for key in args.api_keys.split(',')]
     
     # Initialize LLM client
     llm_client = LLMClient(
         model_name=args.model_name,
+        api_keys=api_keys,
+        base_url=args.base_url,
         temperature=args.temperature,
         top_p=args.top_p,
         max_tokens=args.max_tokens
@@ -185,13 +295,19 @@ def main():
     
     # Translate dataset
     print(f"Translating {args.input_file} to {args.output_file}")
+    print(f"Model: {args.model_name}")
+    print(f"Base URL: {args.base_url}")
+    print(f"API Keys: {len(api_keys)} keys")
+    print(f"Workers: {args.num_workers}")
     translate_dataset(
         input_file=Path(args.input_file),
         output_file=Path(args.output_file),
         llm_client=llm_client,
         prompt_version=args.prompt_version,
         field=args.field,
-        min_cjk_ratio=args.min_cjk_ratio
+        min_cjk_ratio=args.min_cjk_ratio,
+        pool_name=args.pool_name,
+        num_workers=args.num_workers
     )
     
     print("\nTranslation complete!")
