@@ -1,3 +1,13 @@
+# Specified
+*.ipynb_checkpoints
+models
+*__init__.py
+rl_grpo
+result.md
+test_data
+visualize/token_heatmap.html
+visualize/umap*
+
 # Python
 __pycache__/
 *.py[cod]
@@ -39,6 +49,7 @@ venv.bak/
 
 # Data files
 data/
+new_data/
 !data/.gitkeep
 
 # Model checkpoints

@@ -2,17 +2,16 @@
 
 # Base model and SFT checkpoint
 model:
-  base_name: "Qwen/Qwen2-7B-Instruct"
-  sft_checkpoint: "models/sft"
+  base_name: "models/hf_backbones/Qwen3-4B-Instruct-2507"
 
 # Reward model
 reward:
-  classifier_path: "models/classifier/best_model.pt"
-  label_map_path: "models/classifier/label_map.json"
+  classifier_backbone: "/root/WAYF/models/hf_backbones/chinese-roberta-wwm-ext"
+  classifier_path: "models/classifier/Qwen_full/best_model.pt"
+  label_map_path: "models/classifier/Qwen_full/label_map.json"
   
   # Reward weights
   w_cls: 1.0      # Classifier reward weight
-  w_qual: 0.5     # Quality reward weight
   w_kl: 0.1       # KL penalty weight
 
 # GRPO-specific parameters
@@ -21,8 +20,8 @@ grpo:
 
 # Training parameters
 training:
-  batch_size: 4
-  gradient_accumulation_steps: 4
+  batch_size: 16
+  gradient_accumulation_steps: 1
   epochs: 3
   learning_rate: 1e-5
   seed: 42
@@ -34,10 +33,10 @@ instruction:
 
 # Paths
 paths:
-  train_file: "data/rl/pool_b.jsonl"
+  train_file: "data/rl/grpo_train.jsonl"
   output_dir: "models/rl_grpo"
 
-# Hyperparameter sweep for w_cls
-sweep:
-  enabled: false
-  w_cls_values: [0.5, 1.0, 1.5, 2.0]
+wandb:
+  project: "WAYF-RL"
+  name: "grpo-qwen3-4b-lora"
+  mode: "online"

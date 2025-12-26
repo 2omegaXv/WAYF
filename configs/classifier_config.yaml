@@ -2,7 +2,8 @@
 
 # Model configuration
 model:
-  backbone: "hfl/chinese-roberta-wwm-ext"
+  # backbone: "hfl/chinese-roberta-wwm-ext"
+  backbone: "models/hf_backbones/chinese-roberta-wwm-ext"
   hidden_dim: 512
   dropout: 0.1
 
@@ -10,12 +11,17 @@ model:
 training:
   max_length: 512
   batch_size: 32
-  epochs: 10
+  epochs: 5
   learning_rate: 1e-4
   warmup_ratio: 0.1
   seed: 42
 
-# Baseline models to train
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.1
+
+# Baseline models to train (optional)
 baselines:
   - "majority"
   - "stratified_random"
@@ -24,19 +30,23 @@ baselines:
   - "fasttext"
   - "frozen_backbone"
 
-# N-gram settings for baselines
+# N-gram settings for baselines (optional)
 ngram:
   range: [3, 6]
   max_features: 10000
 
+experiment:
+  translation_model: "DeepSeek-V3.2"
+  pool: "a"
+
 # Paths
 paths:
-  train_file: "data/translations/Qwen3-Next-80B-A3B-Instruct/pool_a_zh.jsonl"
-  train_file_supplement: "data/translations/Qwen3-Next-80B-A3B-Instruct/pool_a_augmented_zh.jsonl"
-  valid_file: "data/translations/Qwen3-Next-80B-A3B-Instruct/pool_c_zh.jsonl"
-  test_file: "data/translations/Qwen3-Next-80B-A3B-Instruct/pool_c_zh.jsonl"
-  output_dir: "models/classifier"
-  baselines_output_dir: "models/baselines"
+  # train_file: # used when want to specify certain files to train on
+  #   - "new_data/translated/DeepSeek-V3.2/a_chinese_zh.jsonl"
+  # valid_file: 
+  # test_file: 
+  output_dir: "models/classifier/linear_classifier"
+  # output_dir: "models/classifier_stageA" # Changed for two-stage training
 
 # Metrics to track
 metrics:
@@ -44,23 +54,18 @@ metrics:
   - macro_f1
   - auc
 
-# Hugging Face download/cache settings (optional)
-# - cache_dir: where HF stores its cache (defaults to ~/.cache/huggingface)
-# - local_dir: project-local snapshot directory for the backbone repo
 hf:
   cache_dir: null
   local_dir: models/hf_backbones/chinese-roberta-wwm-ext
 
 # Weights & Biases (optional)
-# Note: Storing API keys in a file is convenient but not ideal; prefer setting
-# WANDB_API_KEY in the environment. If you do set it here, the training script
-# will export it to the process env.
+# Note: Prefer setting WANDB_API_KEY in the environment. If you do set it here, the training script will export it to the process env.
 wandb:
   enabled: True
-  api_key: 263de5fa51af1052229a0f6dcbb9c7c02f68b417
+  api_key: 
   entity: null
   project: "WAYF"
-  name: trail_1
+  name: # run name
   tags: []
   notes: null
   mode: "online"   # online | offline | disabled

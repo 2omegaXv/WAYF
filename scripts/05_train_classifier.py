@@ -16,14 +16,47 @@ from tqdm import tqdm
 import numpy as np
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 import sys
+import jieba.posseg as pseg
 
 sys.path.append(str(Path(__file__).parent))
 from classifier_model import (
     FrozenBackboneClassifier,
     SourceLanguageClassifier,
+    LoraClassifier,
     resolve_pretrained_source,
 )
 
+ENTITY_MAP = {
+    'nr': '[unused1]',  # Person Name (人名) -> [unused1]
+    'ns': '[unused2]',  # Place Name (地名) -> [unused2]
+    'nt': '[unused3]',  # Organization (机构) -> [unused3]
+    'nz': '[unused4]',  # Other Proper Noun (其他专名) -> [unused4]
+}
+
+def mask_entities(text: str) -> List[str]:
+    """
+    Mask person names (nr), place names (ns), organization names (nt), 
+    and other proper nouns (nz) with specific tokens.
+    Returns a list of segments.
+    """
+    words = pseg.cut(text)
+    segments = []
+    for word, flag in words:
+        # nr: Person name
+        # ns: Place name
+        # nt: Organization
+        # nz: Other proper noun
+        if flag.startswith('nr'):
+            segments.append(ENTITY_MAP['nr'])
+        elif flag.startswith('ns'):
+            segments.append(ENTITY_MAP['ns'])
+        elif flag.startswith('nt'):
+            segments.append(ENTITY_MAP['nt'])
+        elif flag.startswith('nz'):
+            segments.append(ENTITY_MAP['nz'])
+        else:
+            segments.append(word)
+    return segments
 
 class TranslationDataset(Dataset):
     """Dataset for classifier training."""
@@ -50,33 +83,57 @@ class TranslationDataset(Dataset):
             with open(data_file, 'r', encoding='utf-8') as f:
                 for line in f:
                     item = json.loads(line)
-                    zh_text = item.get('zh_mt', '')
                     src_lang = item.get('src_lang', '')
 
+                    # Logic: Try 'zh_mt' first. If missing and it's Chinese, use 'src_text'.
+                    zh_text = item.get('zh_mt', '')
+                    if not zh_text and src_lang == 'chinese':
+                        zh_text = item.get('src_text', '')
+
                     if zh_text and src_lang in label_map:
+                        masked_segments = mask_entities(zh_text)
                         self.examples.append({
-                            'text': zh_text,
+                            'segments': masked_segments,
                             'label': label_map[src_lang]
                         })
     
-    def __len__(self):
+    def __len__(self): # used by DataLoader
         return len(self.examples)
     
     def __getitem__(self, idx):
         example = self.examples[idx]
-        
-        # Tokenize
-        encoding = self.tokenizer(
-            example['text'],
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
+        segments = example['segments']
+
+        # Manual tokenization so [unused*] stays as a single token
+        input_ids = [self.tokenizer.cls_token_id]
+
+        for seg in segments:
+            if seg in ENTITY_MAP.values():
+                seg_id = self.tokenizer.convert_tokens_to_ids(seg)
+                if seg_id is None:
+                    seg_id = self.tokenizer.unk_token_id
+                input_ids.append(seg_id)
+            elif seg == "[MASK]":
+                input_ids.append(self.tokenizer.mask_token_id)
+            else:
+                seg_ids = self.tokenizer.encode(seg, add_special_tokens=False)
+                input_ids.extend(seg_ids)
+
+        input_ids.append(self.tokenizer.sep_token_id)
+
+        if len(input_ids) > self.max_length:
+            input_ids = input_ids[: self.max_length - 1] + [self.tokenizer.sep_token_id]
+
+        attention_mask = [1] * len(input_ids)
+        padding_length = self.max_length - len(input_ids)
+
+        if padding_length > 0:
+            input_ids += [self.tokenizer.pad_token_id] * padding_length
+            attention_mask += [0] * padding_length
+
         return {
-            'input_ids': encoding['input_ids'].squeeze(0),
-            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'input_ids': torch.tensor(input_ids, dtype=torch.long),
+            'attention_mask': torch.tensor(attention_mask, dtype=torch.long),
             'labels': torch.tensor(example['label'], dtype=torch.long)
         }
 
@@ -98,30 +155,35 @@ def create_label_map(data_files: Path | List[Path]) -> Dict[str, int]:
     return {lang: idx for idx, lang in enumerate(sorted(languages))}
 
 
+def ensure_list(value) -> List[str]:
+    """Ensure a YAML value is treated as a list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
 def compute_metrics(logits: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
-    """Compute evaluation metrics."""
+    """Compute evaluation metrics from logits and integer labels."""
     preds = np.argmax(logits, axis=1)
-    
-    # Accuracy
+
     accuracy = accuracy_score(labels, preds)
-    
-    # Macro F1
     macro_f1 = f1_score(labels, preds, average='macro')
-    
-    # AUC (one-vs-rest)
+
     try:
         from sklearn.preprocessing import label_binarize
         n_classes = logits.shape[1]
         labels_bin = label_binarize(labels, classes=range(n_classes))
         probs = torch.softmax(torch.from_numpy(logits), dim=1).numpy()
         auc = roc_auc_score(labels_bin, probs, average='macro', multi_class='ovr')
-    except:
+    except Exception:
         auc = 0.0
-    
+
     return {
         'accuracy': accuracy,
         'macro_f1': macro_f1,
-        'auc': auc
+        'auc': auc,
     }
 
 
@@ -137,8 +199,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device):
         
         optimizer.zero_grad()
         
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs['loss']
+        logits = model(input_ids=input_ids, attention_mask=attention_mask)
+        loss = model.loss_fn(logits, labels)
         
         loss.backward()
         optimizer.step()
@@ -162,10 +224,10 @@ def evaluate(model, dataloader, device):
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
             
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            logits = model(input_ids=input_ids, attention_mask=attention_mask)
             
-            total_loss += outputs['loss'].item()
-            all_logits.append(outputs['logits'].cpu().numpy())
+            total_loss += model.loss_fn(logits, labels).item()
+            all_logits.append(logits.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
     
     all_logits = np.concatenate(all_logits, axis=0)
@@ -187,22 +249,16 @@ def main():
     )
     # NOTE: When --config is provided, these CLI flags are ignored (YAML is source of truth).
     # They remain available to preserve backwards compatibility.
-    parser.add_argument("--train_file", type=str, default=None, help="Training data file (ignored if --config is set)")
-    parser.add_argument(
-        "--train_file_supplement",
-        type=str,
-        default=None,
-        help="Optional supplemental training data file (ignored if --config is set)",
-    )
-    parser.add_argument("--valid_file", type=str, default=None, help="Validation data file (ignored if --config is set)")
-    parser.add_argument("--test_file", type=str, default=None, help="Test data file (ignored if --config is set)")
+    parser.add_argument("--train_file", type=str, nargs='+', default=None, help="Training data file (ignored if --config is set)")
+    parser.add_argument("--valid_file", type=str, nargs='+', default=None, help="Validation data file (ignored if --config is set)")
+    parser.add_argument("--test_file", type=str, nargs='+', default=None, help="Test data file (ignored if --config is set)")
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory (ignored if --config is set)")
     parser.add_argument("--model_name", type=str, default=None, help="Backbone model name/path (ignored if --config is set)")
     parser.add_argument("--hf_cache_dir", type=str, default=None, help="HF cache dir (ignored if --config is set)")
     parser.add_argument("--hf_local_dir", type=str, default=None, help="HF local snapshot dir (ignored if --config is set)")
     parser.add_argument(
         "--offline",
-        action="store_true",
+        action="store_true", # args.offline is True if flag is set
         help="If set, only load model/tokenizer files from disk (no network).",
     )
     parser.add_argument(
@@ -221,6 +277,7 @@ def main():
             "then unfreeze for remaining epochs."
         ),
     )
+    parser.add_argument("--lora", action="store_true", help="Use LoRA adapters in backbone")
     parser.add_argument("--max_length", type=int, default=None, help="(ignored if --config is set)")
     parser.add_argument("--batch_size", type=int, default=None, help="(ignored if --config is set)")
     parser.add_argument("--epochs", type=int, default=None, help="(ignored if --config is set)")
@@ -239,9 +296,51 @@ def main():
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
 
+        # --- Auto-resolve paths based on experiment config ---
+        paths_cfg = cfg.get("paths") or {}
+        experiment_cfg = cfg.get("experiment") or {}
+        
+        trans_model = experiment_cfg.get("translation_model")
+        pool = experiment_cfg.get("pool", "a") # Default to 'a' for training
+        
+        if trans_model:
+            base_dir = Path("new_data/translated") / trans_model
+            
+            # Resolve Train Files (Pool A default)
+            if not paths_cfg.get("train_file"):
+                print(f"Auto-resolving train files for Model: {trans_model}, Pool: {pool}")
+                found = sorted(list(base_dir.glob(f"{pool}_*_zh.jsonl")))
+                if found:
+                    paths_cfg["train_file"] = [str(p) for p in found]
+                    print(f"  Found {len(found)} train files.")
+            
+            # Resolve Valid/Test Files (Pool C default)
+            if not paths_cfg.get("valid_file"):
+                print(f"Auto-resolving valid files (Pool C)")
+                found = sorted(list(base_dir.glob(f"c_*_zh.jsonl")))
+                if found:
+                    paths_cfg["valid_file"] = [str(p) for p in found]
+            
+            if not paths_cfg.get("test_file"):
+                print(f"Auto-resolving test files (Pool C)")
+                found = sorted(list(base_dir.glob(f"c_*_zh.jsonl")))
+                if found:
+                    paths_cfg["test_file"] = [str(p) for p in found]
+
+            # Resolve Output Dir
+            if not paths_cfg.get("output_dir"):
+                safe_trans_name = trans_model.replace("/", "_")
+                paths_cfg["output_dir"] = f"models/classifier/{safe_trans_name}"
+                print(f"Auto-resolved output directory: {paths_cfg['output_dir']}")
+        
+        cfg["paths"] = paths_cfg
+        # -----------------------------------------------------
+
         # model
         model_cfg = cfg.get("model", {}) or {}
         args.model_name = model_cfg.get("backbone")
+        args.hidden_dim = int(model_cfg.get("hidden_dim", 512))
+        args.dropout = float(model_cfg.get("dropout", 0.1))
 
         # training
         training_cfg = cfg.get("training", {}) or {}
@@ -254,10 +353,12 @@ def main():
 
         # paths
         paths_cfg = cfg.get("paths", {}) or {}
-        args.train_file = paths_cfg.get("train_file")
-        args.train_file_supplement = paths_cfg.get("train_file_supplement")
-        args.valid_file = paths_cfg.get("valid_file")
-        args.test_file = paths_cfg.get("test_file")
+        args.train_file = ensure_list(paths_cfg.get("train_file"))
+        
+        args.valid_file = ensure_list(paths_cfg.get("valid_file"))
+        
+        args.test_file = ensure_list(paths_cfg.get("test_file"))
+        
         args.output_dir = paths_cfg.get("output_dir")
 
         # Optional HF cache/snapshot paths from YAML if present
@@ -267,8 +368,14 @@ def main():
         if args.hf_local_dir is None:
             args.hf_local_dir = hf_cfg.get("local_dir")
 
+        if args.lora:
+            lora_cfg = cfg.get("lora", {}) or {}
+            args.lora_r = int(lora_cfg.get("r", 8))
+            args.lora_alpha = int(lora_cfg.get("lora_alpha", 16))
+            args.lora_dropout = float(lora_cfg.get("lora_dropout", 0.1))
+
     else:
-        # No config: fall back to CLI defaults
+        # Defaults with neither YAML nor CLI values
         args.model_name = args.model_name or "hfl/chinese-roberta-wwm-ext"
         args.max_length = 512 if args.max_length is None else args.max_length
         args.batch_size = 32 if args.batch_size is None else args.batch_size
@@ -277,31 +384,49 @@ def main():
         args.warmup_ratio = 0.1 if args.warmup_ratio is None else args.warmup_ratio
         args.seed = 42 if args.seed is None else args.seed
 
-    # Validate required values after config/CLI resolution
-    missing = [
-        name
-        for name in ("train_file", "valid_file", "test_file", "output_dir", "model_name")
-        if not getattr(args, name)
-    ]
+    # Check whether arguments are missing
+    required_fields = ("train_file", "valid_file", "test_file", "output_dir", "model_name")
+    missing = []
+    for name in required_fields:
+        value = getattr(args, name, None)
+        if name == "train_file" or name == "valid_file" or name == "test_file":
+            if not value or (isinstance(value, list) and len(value) == 0):
+                missing.append(name)
+        else:
+            if not value:
+                missing.append(name)
     if missing:
         raise ValueError(
             "Missing required settings: " + ", ".join(missing) +
             ". Provide them in --config YAML (recommended) or via CLI flags."
         )
 
-    if args.train_file_supplement:
-        supplement_path = Path(args.train_file_supplement)
-        if not supplement_path.exists():
-            raise FileNotFoundError(f"train_file_supplement not found: {supplement_path}")
+    # Validate input files exist
+    for p in [Path(v) for v in (args.train_file or [])]:
+        if not p.exists():
+            raise FileNotFoundError(f"train_file not found: {p}")
+    for p in [Path(v) for v in (args.valid_file or [])]:
+        if not p.exists():
+            raise FileNotFoundError(f"valid_file not found: {p}")
+    for p in [Path(v) for v in (args.test_file or [])]:
+        if not p.exists():
+            raise FileNotFoundError(f"test_file not found: {p}")
 
-    def set_backbone_trainable(model_obj, trainable: bool):
+    def set_backbone_trainable(model_obj, trainable: bool, use_lora: bool = False):
         if not hasattr(model_obj, "backbone"):
             return
-        for param in model_obj.backbone.parameters():
-            param.requires_grad = trainable
+        if not use_lora:
+            for param in model_obj.backbone.parameters():
+                param.requires_grad = trainable
+        else:
+            for name, param in model_obj.backbone.named_parameters():
+                if "lora" in name:
+                    param.requires_grad = trainable
+                else:
+                    param.requires_grad = False
     
     # Set seed
-    torch.manual_seed(args.seed)
+    torch.manual_seed(args.seed) # affects shuffle
     np.random.seed(args.seed)
 
     # Initialize Weights & Biases (optional)
@@ -354,9 +479,9 @@ def main():
     print(f"Using device: {device}")
     
     # Create label map (train = primary + optional supplement)
-    train_files: List[Path] = [Path(args.train_file)]
-    if args.train_file_supplement:
-        train_files.append(Path(args.train_file_supplement))
+    train_files: List[Path] = [Path(p) for p in (args.train_file or [])]
+    valid_files: List[Path] = [Path(p) for p in (args.valid_file or [])]
+    test_files: List[Path] = [Path(p) for p in (args.test_file or [])]
 
     label_map = create_label_map(train_files)
     num_languages = len(label_map)
@@ -369,7 +494,7 @@ def main():
     with open(output_dir / "label_map.json", 'w') as f:
         json.dump(label_map, f, indent=2)
     
-    # Load tokenizer
+    # Load tokenizer IS RESUME IMPLEMENTED?
     resolved_backbone = resolve_pretrained_source(
         args.model_name,
         cache_dir=args.hf_cache_dir,
@@ -385,8 +510,8 @@ def main():
     
     # Create datasets
     train_dataset = TranslationDataset(train_files, tokenizer, label_map, args.max_length)
-    valid_dataset = TranslationDataset(Path(args.valid_file), tokenizer, label_map, args.max_length)
-    test_dataset = TranslationDataset(Path(args.test_file), tokenizer, label_map, args.max_length)
+    valid_dataset = TranslationDataset(valid_files, tokenizer, label_map, args.max_length)
+    test_dataset = TranslationDataset(test_files, tokenizer, label_map, args.max_length)
     
     # Create dataloaders
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
@@ -398,14 +523,33 @@ def main():
         model = FrozenBackboneClassifier(
             num_languages,
             args.model_name,
+            dropout=args.dropout,
+            hidden_dim=args.hidden_dim,
             cache_dir=args.hf_cache_dir,
             local_dir=args.hf_local_dir,
             local_files_only=args.offline,
         )
+    elif args.lora:
+        model = LoraClassifier(
+            num_languages,
+            args.model_name,
+            dropout=args.dropout,
+            hidden_dim=args.hidden_dim,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            cache_dir=args.hf_cache_dir,
+            local_dir=args.hf_local_dir,
+            local_files_only=args.offline,
+        )
+        if args.freeze_backbone_epochs > 0:
+            set_backbone_trainable(model, trainable=False)
     else:
         model = SourceLanguageClassifier(
             num_languages,
             args.model_name,
+            dropout=args.dropout,
+            hidden_dim=args.hidden_dim,
             cache_dir=args.hf_cache_dir,
             local_dir=args.hf_local_dir,
             local_files_only=args.offline,
@@ -437,9 +581,12 @@ def main():
     for epoch in range(args.epochs):
         print(f"\n=== Epoch {epoch + 1}/{args.epochs} ===")
 
-        if (not args.frozen_backbone) and args.freeze_backbone_epochs > 0:
+        if (not args.frozen_backbone) and args.freeze_backbone_epochs > 0: # If both unset, use SourceLanguageClassifier end-to-end from start
             if epoch == args.freeze_backbone_epochs:
-                set_backbone_trainable(model, trainable=True)
+                if args.lora:
+                    set_backbone_trainable(model, trainable=True, use_lora=True)
+                else:
+                    set_backbone_trainable(model, trainable=True)
                 print("Unfroze backbone; continuing end-to-end fine-tuning")
         
         train_loss = train_epoch(model, train_loader, optimizer, scheduler, device)

@@ -1,0 +1,42 @@
+# LLM baseline config (source-language classification)
+
+# Experiment Control
+# Change these values to switch datasets and models easily
+experiment:
+  translation_model: "DeepSeek-V3.2"  # The model that generated the translations (Folder name in new_data/translated)
+  pool: "c"                           # The data pool to evaluate (a, b, or c)
+
+paths:
+  output_dir: # can specify output directory here, or it will be auto-resolved
+
+# LLM Baseline Model Configuration
+llm:
+  base_url: "https://llmapi.paratera.com"
+  model_name: "DeepSeek-V3.2"         # The model acting as the classifier
+
+  # Prefer env vars for secrets.
+  # Example:
+  # export API_KEYS="sk-... ,sk-..."
+  api_keys_env: "API_KEYS"
+  # or you can list them here (not recommended for security reasons)
+  api_keys:
+
+  num_workers: 800
+
+  # Retry policy
+  max_attempts: 4
+  max_retries: 5
+  temperature: 0.0
+  top_p: 1.0
+  max_tokens: 1024
+
+prompt:
+  allowed_labels:
+    - chinese
+    - english
+    - french
+    - german
+    - japanese
+    - korean
+    - russian
+    - spanish
